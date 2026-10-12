@@ -18,8 +18,6 @@ on:
         required: false
         default: '0'
 
-# 加固点0：显式声明写权限。即便当前没建 Release 也建议保留，
-# 一旦后续 step 需要上传产物 / 建 Release，缺它就会 401/403。
 permissions:
   contents: write
 
@@ -51,54 +49,68 @@ jobs:
     - name: patch
       env:
         ANTIROLL: "${{ github.event.inputs.antiroll }}"
-        # 加固点1：把运行时 token 注入环境变量，setup-7zz.sh / avbctl
-        # 这些内部要访问 GitHub 的脚本也能复用，避开匿名限流(403)。
         GH_TOKEN: ${{ github.token }}
       run: |
-        # 加固点2：任一命令失败立刻中止并暴露，不再"假成功后死在 unzip"
         set -euo pipefail
 
-        sudo apt update
-        sudo apt -y install build-essential openssl curl wget busybox xz-utils python3 file
-
-        # 加固点3：统一的"健壮下载"函数——重试 + 超时 + 遇 4xx/5xx 即失败(-f)
-        #          + 下完校验文件类型，防止把 HTML 错误页当成二进制混过去
+        # 统一健壮下载：重试+超时+HTTP错误码立即失败+下完自检
         dl() {
           local url="$1" out="$2"
-          echo ">> downloading $out from: $url"
-          curl -fsSL \
-            --retry 5 --retry-delay 3 --retry-connrefused \
-            --connect-timeout 15 --max-time 600 \
-            -o "$out" "$url"
-          if file "$out" | grep -qi 'HTML'; then
-            echo "ERROR: $out came back as an HTML page (bad/expired URL), not a binary." >&2
-            exit 1
-          fi
-          echo ">> $out OK ($(stat -c%s "$out") bytes)"
+          echo ">> 下载 ${out}: ${url}"
+          curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
+               --connect-timeout 15 --max-time 600 \
+               -o "${out}" "${url}"
+          file "${out}"
         }
 
-        # install static 7zz used by the scripts instead of busybox unzip:
-        # latest official ip7z/7zip linux-x64 release (resolved via GitHub API),
-        # falling back to the mcmilk/7-Zip-zstd nightly linux-clang-x64 build
+        sudo apt update
+        sudo apt -y install build-essential openssl curl wget busybox xz-utils python3 jq
+
         chmod +x main/setup-7zz.sh
         ./main/setup-7zz.sh
 
-        # build avbctl, the static C replacement for the python2 avbtool
-        # (fetches mbedtls-3.6 and links it statically)
+        # build avbctl
         make -C main/avbctl
 
-        # 下载外部固件包（你手动填的 ZIP_URL，就是之前 41 秒挂掉的那步）
         dl "${{ github.event.inputs.ZIP_URL }}" original.zip
+        unzip -t original.zip >/dev/null   # 确认拿到的是完整 zip 而非错误页
 
-        # 加固点4：Magisk 最新版改用带 token 的 API + 纯 URL 提取。
-        # 原写法匿名调用会被限流(403)，且 grep 取到的是带键名的 JSON 片段，
-        # 直接喂给 curl 会拼出一个非法地址。
-        MAGISK_URL=$(curl -fsSL --retry 5 --retry-delay 3 \
-            -H "Authorization: Bearer ${{ github.token }}" \
-            https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
-            | grep -Po '"browser_download_url":\s*"\Khttps://[^"]+\.apk')
-        echo ">> resolved Magisk APK: $MAGISK_URL"
-        dl "$MAGISK_URL" magisk.apk
+        # ===== 修复点：Magisk APK 地址提取 =====
+        # 根因：releases API 里同一个 tag 下有 app-debug.apk 和 Magisk-vX.Y.apk 两个
+        # asset，旧写法把它们全抓下来拼成一个多行字符串喂给 curl，curl 报
+        # (3) URL rejected: Malformed input to a URL function (exit code 3)。
+        # 修法：用 jq 只取"正式发布包 Magisk-v*.apk"，head -n1 保证单行干净 URL。
+        MAGISK_URL=$(curl -fsSL --retry 5 --connect-timeout 15 --max-time 120 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/topjohnwu/Magisk/releases/latest" \
+          | jq -r '.assets[].browser_download_url' \
+          | grep -E '/Magisk-v[0-9][^/]*\.apk$' \
+          | head -n1)
 
-        # === 你原 run_v3.yml 中此步之后的真实命令（解压固件包、BSP 重签名、
-        #     magisk 修补 boot、打包产物等）请原样接在这里，本次改动未触及它们 ===
+        if [ -z "${MAGISK_URL}" ]; then
+          echo "!! 没能解析到 Magisk 正式 APK 下载地址" >&2
+          exit 1
+        fi
+        echo ">> 解析到 Magisk APK: ${MAGISK_URL}"
+
+        dl "${MAGISK_URL}" magisk.apk
+
+        wget https://raw.githubusercontent.com/magojohnji/magiskboot-linux/main/x86_64/magiskboot
+        chmod +x magiskboot
+        chmod +x main/*.sh
+        mv main/sign_v3.sh ./
+        if ! [[ "$ANTIROLL" =~ ^[0-9]+$ ]]; then echo "antiroll must be a non-negative integer"; exit 1; fi
+        sed -i "s/trusted_version=.*/trusted_version=$ANTIROLL/" main/config/version.cfg
+        ./sign_v3.sh
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          resigned.zip
+        name: ${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          URL: ${{ github.event.inputs.ZIP_URL }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
